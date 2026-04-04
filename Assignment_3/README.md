@@ -2,9 +2,7 @@ Assignment 3: Implemented Deep Residual Learning for Image Recognition from scra
 
 To run the code: python a20.py
 
-Requirements: 
-
-torch==2.5.1+cu121
+Requirements: torch==2.5.1+cu121
 torchvision==0.20.1+cu121
 torchaudio==2.5.1+cu121
 numpy==2.2.6

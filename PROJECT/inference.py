@@ -78,167 +78,116 @@ def rotate_img(img, angle):
 
 
 # ══════════════════════════════════════════════════════════════
-#  STEP 2 — MULTI-PASS BFS STITCHER
+#  STEP 2 — BOUNDARY ENFORCED BFS STITCHER  (working approach)
 #
 #  patch_0 = top-left anchor (guaranteed by problem statement)
-#  Algorithm: BFS template matching on boundary strips, 4 rotations
-#  Pass 1 (conf=0.90) → Pass 2 (0.82) → Pass 3 (0.70) → Pass 4 (0.60)
-#  Any remaining unplaced → grid fallback (no black tiles)
+#  Single-pass BFS with template matching on boundary strips.
+#  Tries all 4 rotations per candidate patch per side.
+#  Boundary rule: rejects placements going left/above patch_0.
 # ══════════════════════════════════════════════════════════════
+def stitch_patches(images, grays):
+    num_patches = len(images)
+    patch_size  = images[0].shape[0]   # dynamically fetched (not hardcoded)
 
-CV2_ROTS = {
-    0: None,
-    90:  cv2.ROTATE_90_COUNTERCLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_CLOCKWISE,
-}
+    f_size = 25   # fingerprint strip width
+    s_zone = 64   # search zone width
 
+    ans     = {0: (0, 0, 0)}   # pid → (gx, gy, rotation)
+    queue   = deque([0])
+    visited = {0}
 
-def bfs_pass(images, grays, ans, visited, confidence,
-             patch_h, patch_w, f_size, s_zone, boundary_slack):
-    queue = deque(sorted(visited))
-    newly = 0
+    rotations = [
+        (0,   None),
+        (90,  cv2.ROTATE_90_COUNTERCLOCKWISE),
+        (180, cv2.ROTATE_180),
+        (270, cv2.ROTATE_90_CLOCKWISE),
+    ]
+
+    print("Growing map with top-left boundary enforcement ...")
 
     while queue:
         i = queue.popleft()
-        curr_x, curr_y, rot_i = ans[i]
+        curr_x, curr_y, _ = ans[i]
 
-        gi_rot = rotate_img(grays[i], rot_i) if rot_i != 0 else grays[i]
-        fp = {
-            "right":  gi_rot[:, -f_size:],
-            "left":   gi_rot[:, :f_size],
-            "bottom": gi_rot[-f_size:, :],
-            "top":    gi_rot[:f_size, :],
+        fingerprints_i = {
+            'right':  grays[i][:, -f_size:],
+            'left':   grays[i][:, :f_size],
+            'bottom': grays[i][-f_size:, :],
+            'top':    grays[i][:f_size, :],
         }
 
-        unvisited = [idx for idx in range(len(images)) if idx not in visited]
+        unvisited_pool = [idx for idx in range(num_patches) if idx not in visited]
 
-        for j in unvisited:
-            best_score = -1
-            best_state = None
-
-            for angle in [0, 90, 180, 270]:
-                rot_j = rotate_img(grays[j], angle) if angle != 0 else grays[j]
+        for j in unvisited_pool:
+            found_j = False
+            for angle, cv2_rot in rotations:
+                rot_j = cv2.rotate(grays[j], cv2_rot) if cv2_rot else grays[j]
 
                 configs = [
-                    ("right",  rot_j[:, :s_zone],   1,  0),
-                    ("bottom", rot_j[:s_zone, :],    0,  1),
-                    ("left",   rot_j[:, -s_zone:],  -1,  0),
-                    ("top",    rot_j[-s_zone:, :],   0, -1),
+                    ('right',  rot_j[:, :s_zone],   1,  0),
+                    ('bottom', rot_j[:s_zone, :],    0,  1),
+                    ('left',   rot_j[:, -s_zone:],  -1,  0),
+                    ('top',    rot_j[-s_zone:, :],   0, -1),
                 ]
 
-                for side_i, search_strip, dx_dir, dy_dir in configs:
-                    if np.std(fp[side_i]) < 5:
-                        continue
-                    if search_strip.shape[0] < fp[side_i].shape[0] or \
-                       search_strip.shape[1] < fp[side_i].shape[1]:
+                for side_i, search_area_j, dx_dir, dy_dir in configs:
+                    if np.std(fingerprints_i[side_i]) < 5:
                         continue
 
-                    try:
-                        res = cv2.matchTemplate(
-                            search_strip, fp[side_i], cv2.TM_CCOEFF_NORMED)
-                    except cv2.error:
-                        continue
-
+                    res = cv2.matchTemplate(
+                        search_area_j, fingerprints_i[side_i], cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    if max_val < confidence:
-                        continue
 
-                    mx, my = max_loc
-                    if dx_dir == 1:    tx, ty = (patch_w - f_size - mx), -my
-                    elif dx_dir == -1: tx, ty = (-patch_w + s_zone - mx), -my
-                    elif dy_dir == 1:  tx, ty = -mx, (patch_h - f_size - my)
-                    else:              tx, ty = -mx, (-patch_h + s_zone - my)
+                    if max_val > 0.82:
+                        mx, my = max_loc
 
-                    gx = curr_x + tx
-                    gy = curr_y + ty
+                        if dx_dir == 1:    tx, ty = (patch_size - f_size - mx), -my
+                        if dx_dir == -1:   tx, ty = (-patch_size + s_zone - mx), -my
+                        if dy_dir == 1:    tx, ty = -mx, (patch_size - f_size - my)
+                        if dy_dir == -1:   tx, ty = -mx, (-patch_size + s_zone - my)
 
-                    if gx < -boundary_slack or gy < -boundary_slack:
-                        continue
+                        gx, gy = curr_x + tx, curr_y + ty
 
-                    if max_val > best_score:
-                        best_score = max_val
-                        best_state = (gx, gy, angle)
+                        # Boundary rule: patch_0 is top-left
+                        if gx < -20 or gy < -20:
+                            continue
 
-            if best_state is not None:
-                ans[j]   = best_state
-                visited.add(j)
-                queue.append(j)
-                newly += 1
+                        ans[j]   = (gx, gy, angle)
+                        visited.add(j)
+                        queue.append(j)
+                        found_j  = True
+                        print(f"  Placed patch_{j} at ({int(gx)},{int(gy)}) "
+                              f"rot={angle} score={max_val:.3f}")
+                        break
 
-    return newly
+                if found_j:
+                    break
 
+    placed = len(visited)
+    print(f"\n[STITCH] {placed}/{num_patches} patches placed.")
 
-def grid_dims(n):
-    cols = round(math.sqrt(n))
-    while cols > 1 and n % cols != 0:
-        cols -= 1
-    rows = n // cols
-    if rows < cols:
-        rows, cols = cols, rows
-    return rows, cols
-
-
-def stitch_patches(images, grays):
-    num              = len(images)
-    patch_h, patch_w = images[0].shape[:2]
-    f_size           = max(10, patch_h // 10)
-    s_zone           = max(20, patch_h // 4)
-    boundary_slack   = patch_w * 0.6
-
-    print(f"[STITCH] {num} patches  patch={patch_w}x{patch_h}  "
-          f"f_size={f_size}  s_zone={s_zone}")
-
-    ans     = {0: (0, 0, 0)}
-    visited = {0}
-
-    for pass_name, conf in [("Pass1 strict", 0.90), ("Pass2 medium", 0.82),
-                             ("Pass3 relaxed", 0.70), ("Pass4 loose", 0.60)]:
-        newly = bfs_pass(images, grays, ans, visited, conf,
-                         patch_h, patch_w, f_size, s_zone, boundary_slack)
-        print(f"  [{pass_name}] conf={conf:.2f}  +{newly}  "
-              f"total={len(visited)}/{num}")
-        if len(visited) == num:
-            break
-
-    # Grid fallback — guarantee no black tiles
-    unplaced = set(range(num)) - visited
-    if unplaced:
-        print(f"[STITCH] Grid fallback for {len(unplaced)} patches ...")
-        rows, cols = grid_dims(num)
-        occupied   = set()
-        for pid, (gx, gy, _) in ans.items():
-            occupied.add((round(gy / patch_h), round(gx / patch_w)))
-        ul = sorted(unplaced)
-        idx = 0
-        for r in range(rows):
-            for c in range(cols):
-                if idx >= len(ul): break
-                if (r, c) not in occupied:
-                    ans[ul[idx]] = (c * patch_w, r * patch_h, 0)
-                    visited.add(ul[idx])
-                    occupied.add((r, c))
-                    idx += 1
-
-    # Render
+    # ── Render canvas ────────────────────────────────────────
     min_x = min(v[0] for v in ans.values())
     min_y = min(v[1] for v in ans.values())
-    max_x = max(v[0] for v in ans.values()) + patch_w
-    max_y = max(v[1] for v in ans.values()) + patch_h
-    canvas = np.zeros((int(max_y - min_y), int(max_x - min_x), 3), dtype=np.uint8)
+    max_x = max(v[0] for v in ans.values()) + patch_size
+    max_y = max(v[1] for v in ans.values()) + patch_size
 
-    for pid in sorted(ans.keys()):
-        gx, gy, angle = ans[pid]
-        img = rotate_img(images[pid], angle)
-        y, x = int(gy - min_y), int(gx - min_x)
-        h = min(patch_h, canvas.shape[0] - y)
-        w = min(patch_w, canvas.shape[1] - x)
-        if h > 0 and w > 0 and x >= 0 and y >= 0:
-            canvas[y:y+h, x:x+w] = img[:h, :w]
+    canvas_w = int(max_x - min_x)
+    canvas_h = int(max_y - min_y)
+    canvas   = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+    for p_id, (gx, gy, angle) in ans.items():
+        p_img = images[p_id]
+        if angle == 90:  p_img = cv2.rotate(p_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if angle == 180: p_img = cv2.rotate(p_img, cv2.ROTATE_180)
+        if angle == 270: p_img = cv2.rotate(p_img, cv2.ROTATE_90_CLOCKWISE)
+
+        y = int(gy - min_y)
+        x = int(gx - min_x)
+        canvas[y:y+patch_size, x:x+patch_size] = p_img
 
     black_pct = (canvas.sum(axis=2) == 0).mean() * 100
-    print(f"[STITCH] Done. Canvas={canvas.shape[1]}x{canvas.shape[0]}  "
-          f"black={black_pct:.1f}%")
+    print(f"[STITCH] Canvas={canvas_w}x{canvas_h}  black={black_pct:.1f}%")
     return canvas
 
 

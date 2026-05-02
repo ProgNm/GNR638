@@ -87,91 +87,94 @@ def rotate_img(img, angle):
 # ══════════════════════════════════════════════════════════════
 def stitch_patches(images, grays):
     num_patches = len(images)
-    patch_size = images[0].shape[0]
+    patch_size  = images[0].shape[0]   # dynamically fetched (not hardcoded)
 
-    # Fingerprint/Search settings — scaled to patch size (works for any map)
-    f_size = max(10, patch_size // 6)   # ~16% of patch: enough context, not too wide
-    s_zone = max(20, patch_size // 3)   # ~33% of patch: search zone on candidate side
+    f_size = 25   # fingerprint strip width
+    s_zone = 64   # search zone width
 
-    # ans[patch_id] = (global_x, global_y, rotation_angle)
-    # Patch 0 is Top-Left (0, 0)
-    ans = {0: (0, 0, 0)}
-    queue = deque([0])
+    ans     = {0: (0, 0, 0)}   # pid → (gx, gy, rotation)
+    queue   = deque([0])
     visited = {0}
 
-    rotations = [(0, None), (90, cv2.ROTATE_90_COUNTERCLOCKWISE),
-                 (180, cv2.ROTATE_180), (270, cv2.ROTATE_90_CLOCKWISE)]
+    rotations = [
+        (0,   None),
+        (90,  cv2.ROTATE_90_COUNTERCLOCKWISE),
+        (180, cv2.ROTATE_180),
+        (270, cv2.ROTATE_90_CLOCKWISE),
+    ]
 
-    print("🧩 Growing Map with Top-Left Boundary Enforcement...")
+    print("Growing map with top-left boundary enforcement ...")
 
     while queue:
         i = queue.popleft()
         curr_x, curr_y, _ = ans[i]
 
-        # Current patch sides
         fingerprints_i = {
             'right':  grays[i][:, -f_size:],
             'left':   grays[i][:, :f_size],
             'bottom': grays[i][-f_size:, :],
-            'top':    grays[i][:f_size, :]
+            'top':    grays[i][:f_size, :],
         }
 
         unvisited_pool = [idx for idx in range(num_patches) if idx not in visited]
 
         for j in unvisited_pool:
             found_j = False
-            # Check every rotation
             for angle, cv2_rot in rotations:
                 rot_j = cv2.rotate(grays[j], cv2_rot) if cv2_rot else grays[j]
 
-                # Possible ways J can connect to I
                 configs = [
-                    ('right',  rot_j[:, :s_zone],  1, 0),   # J is Right of I
-                    ('bottom', rot_j[:s_zone, :],  0, 1),   # J is Below I
-                    ('left',   rot_j[:, -s_zone:], -1, 0),  # J is Left of I
-                    ('top',    rot_j[-s_zone:, :], 0, -1)   # J is Above I
+                    ('right',  rot_j[:, :s_zone],   1,  0),
+                    ('bottom', rot_j[:s_zone, :],    0,  1),
+                    ('left',   rot_j[:, -s_zone:],  -1,  0),
+                    ('top',    rot_j[-s_zone:, :],   0, -1),
                 ]
 
                 for side_i, search_area_j, dx_dir, dy_dir in configs:
-                    if np.std(fingerprints_i[side_i]) < 5: continue
+                    if np.std(fingerprints_i[side_i]) < 5:
+                        continue
 
-                    res = cv2.matchTemplate(search_area_j, fingerprints_i[side_i], cv2.TM_CCOEFF_NORMED)
+                    res = cv2.matchTemplate(
+                        search_area_j, fingerprints_i[side_i], cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-                    if max_val > 0.82: # Strict confidence
+                    if max_val > 0.82:
                         mx, my = max_loc
 
-                        # Calculate exact relative shift
-                        if dx_dir == 1:  tx, ty = (patch_size - f_size - mx), -my
-                        if dx_dir == -1: tx, ty = (-patch_size + s_zone - mx), -my
-                        if dy_dir == 1:  tx, ty = -mx, (patch_size - f_size - my)
-                        if dy_dir == -1: tx, ty = -mx, (-patch_size + s_zone - my)
+                        if dx_dir == 1:    tx, ty = (patch_size - f_size - mx), -my
+                        if dx_dir == -1:   tx, ty = (-patch_size + s_zone - mx), -my
+                        if dy_dir == 1:    tx, ty = -mx, (patch_size - f_size - my)
+                        if dy_dir == -1:   tx, ty = -mx, (-patch_size + s_zone - my)
 
-                        # Calculate Global Coordinates
                         gx, gy = curr_x + tx, curr_y + ty
 
-                        # --- THE BOUNDARY RULE ---
+                        # Boundary rule: patch_0 is top-left
                         if gx < -20 or gy < -20:
                             continue
 
-                        ans[j] = (gx, gy, angle)
+                        ans[j]   = (gx, gy, angle)
                         visited.add(j)
                         queue.append(j)
-                        found_j = True
-                        print(f"✅ Placed {j} at ({int(gx)}, {int(gy)}) | Score: {max_val:.2f}")
+                        found_j  = True
+                        print(f"  Placed patch_{j} at ({int(gx)},{int(gy)}) "
+                              f"rot={angle} score={max_val:.3f}")
                         break
-                if found_j: break
 
-    print(f"\nFinal count: {len(visited)} patches anchored out of {num_patches}.")
+                if found_j:
+                    break
 
-    # --- Painting (Coordinate-Aware) ---
+    placed = len(visited)
+    print(f"\n[STITCH] {placed}/{num_patches} patches placed.")
+
+    # ── Render canvas ────────────────────────────────────────
     min_x = min(v[0] for v in ans.values())
     min_y = min(v[1] for v in ans.values())
     max_x = max(v[0] for v in ans.values()) + patch_size
     max_y = max(v[1] for v in ans.values()) + patch_size
 
-    canvas_w, canvas_h = int(max_x - min_x), int(max_y - min_y)
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas_w = int(max_x - min_x)
+    canvas_h = int(max_y - min_y)
+    canvas   = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
     for p_id, (gx, gy, angle) in ans.items():
         p_img = images[p_id]
@@ -179,9 +182,12 @@ def stitch_patches(images, grays):
         if angle == 180: p_img = cv2.rotate(p_img, cv2.ROTATE_180)
         if angle == 270: p_img = cv2.rotate(p_img, cv2.ROTATE_90_CLOCKWISE)
 
-        y, x = int(gy - min_y), int(gx - min_x)
+        y = int(gy - min_y)
+        x = int(gx - min_x)
         canvas[y:y+patch_size, x:x+patch_size] = p_img
 
+    black_pct = (canvas.sum(axis=2) == 0).mean() * 100
+    print(f"[STITCH] Canvas={canvas_w}x{canvas_h}  black={black_pct:.1f}%")
     return canvas
 
 
